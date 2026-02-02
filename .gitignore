@@ -1,0 +1,30 @@
+# Исполняемые файлы
+telegram-ollama-bot
+telegram-ollama-bot.exe
+
+# Go специфичные файлы
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Тестовые бинарники
+*.test
+
+# Выходные файлы
+*.out
+
+# Переменные окружения (не коммитим реальные токены)
+.env
+
+# IDE файлы
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS файлы
+.DS_Store
+Thumbs.db
