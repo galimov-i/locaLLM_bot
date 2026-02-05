@@ -37,7 +37,8 @@ type OllamaClient struct {
 func NewOllamaClient() *OllamaClient {
 	url := os.Getenv("OLLAMA_URL")
 	if url == "" {
-		url = "http://45.155.204.73:11434"
+		// Значение по умолчанию - localhost, так как бот обычно запускается на той же машине
+		url = "http://localhost:11434"
 	}
 
 	model := os.Getenv("OLLAMA_MODEL")
@@ -73,7 +74,7 @@ func (c *OllamaClient) SendPrompt(prompt string) (string, error) {
 	req.Header.Set("Content-Type", "application/json")
 
 	client := &http.Client{
-		Timeout: 120 * time.Second, // Таймаут 2 минуты для генерации
+		Timeout: 480 * time.Second, // Таймаут 8 минут для генерации
 	}
 
 	resp, err := client.Do(req)

@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 )
 
 func main() {
@@ -23,27 +25,34 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-	// Канал для остановки основного цикла
-	done := make(chan bool)
+	// Создаем контекст для остановки горутины
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	// Запускаем основной цикл в горутине
 	go func() {
 		for {
-			updates, err := bot.GetUpdates()
-			if err != nil {
-				log.Printf("Ошибка получения обновлений: %v", err)
-				// Продолжаем работу после ошибки
-				continue
-			}
-
-			// Обрабатываем каждое обновление
-			for _, update := range updates {
-				if update.UpdateID > bot.LastUpdate {
-					bot.LastUpdate = update.UpdateID
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				updates, err := bot.GetUpdates()
+				if err != nil {
+					log.Printf("Ошибка получения обновлений: %v", err)
+					// Задержка перед повтором, чтобы не спамить запросами
+					time.Sleep(5 * time.Second)
+					continue
 				}
 
-				if update.Message != nil {
-					bot.HandleMessage(update.Message)
+				// Обрабатываем каждое обновление
+				for _, update := range updates {
+					if update.UpdateID > bot.LastUpdate {
+						bot.LastUpdate = update.UpdateID
+					}
+
+					if update.Message != nil {
+						bot.HandleMessage(update.Message)
+					}
 				}
 			}
 		}
@@ -52,6 +61,8 @@ func main() {
 	// Ожидаем сигнал завершения
 	<-sigChan
 	log.Println("Получен сигнал завершения. Останавливаю бота...")
-	close(done)
+	cancel()
+	// Даем время горутине завершиться
+	time.Sleep(1 * time.Second)
 	log.Println("Бот остановлен.")
 }

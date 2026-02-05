@@ -95,6 +95,11 @@ func (bot *TelegramBot) GetUpdates() ([]Update, error) {
 		return nil, fmt.Errorf("Telegram API вернул ошибку: %s", telegramResp.Description)
 	}
 
+	// Проверяем, что result не nil
+	if telegramResp.Result == nil {
+		return []Update{}, nil
+	}
+
 	// Парсим result как массив обновлений
 	resultBytes, err := json.Marshal(telegramResp.Result)
 	if err != nil {
@@ -187,7 +192,7 @@ func (bot *TelegramBot) handleCommand(chatID int64, command string) {
 	switch command {
 	case "/start":
 		msg := "Привет! Я бот для работы с Ollama LLM.\n\n" +
-			"Просто отправь мне сообщение, и я передам его модели gemma3:1b для генерации ответа.\n\n" +
+			"Просто отправь мне сообщение, и я передам его модели для генерации ответа.\n\n" +
 			"Используй /help для получения справки."
 		if err := bot.SendMessage(chatID, msg); err != nil {
 			log.Printf("Ошибка отправки сообщения: %v", err)

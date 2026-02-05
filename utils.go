@@ -7,6 +7,10 @@ func SplitMessage(text string, maxLen int) []string {
 		return []string{text}
 	}
 
+	if maxLen <= 0 {
+		maxLen = 4000 // Защита от некорректного значения
+	}
+
 	var parts []string
 	current := text
 
@@ -30,8 +34,19 @@ func SplitMessage(text string, maxLen int) []string {
 			}
 		}
 
+		// Если все еще не нашли подходящее место и текст слишком длинный,
+		// принудительно разбиваем по maxLen, чтобы избежать бесконечного цикла
+		if splitPos == maxLen && len(current) > maxLen {
+			splitPos = maxLen
+		}
+
 		parts = append(parts, current[:splitPos])
 		current = current[splitPos:]
+		
+		// Пропускаем начальные пробелы/переносы строк в следующей части
+		for len(current) > 0 && (current[0] == ' ' || current[0] == '\n') {
+			current = current[1:]
+		}
 	}
 
 	if len(current) > 0 {
