@@ -82,9 +82,7 @@ func (c *OllamaClient) SendPrompt(prompt string) (string, error) {
 
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{
-		Timeout: 480 * time.Second, // Таймаут 8 минут для генерации
-	}
+	client := newHTTPClient(480 * time.Second) // Таймаут 8 минут для генерации
 
 	resp, err := client.Do(req)
 	if err != nil {

@@ -176,9 +176,7 @@ func (bot *TelegramBot) GetUpdates() ([]Update, error) {
 	url := fmt.Sprintf("%s/getUpdates?offset=%d&timeout=30", bot.APIURL, bot.LastUpdate+1)
 
 	// Используем клиент с таймаутом: 30с long polling + 10с запас
-	client := &http.Client{
-		Timeout: 40 * time.Second,
-	}
+	client := newHTTPClient(40 * time.Second)
 
 	resp, err := client.Get(url)
 	if err != nil {
@@ -244,9 +242,7 @@ func (bot *TelegramBot) SendMessage(chatID int64, text string) error {
 
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-	}
+	client := newHTTPClient(10 * time.Second)
 
 	resp, err := client.Do(req)
 	if err != nil {
