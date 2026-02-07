@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -39,6 +41,13 @@ func NewOllamaClient() *OllamaClient {
 	if url == "" {
 		// Значение по умолчанию - localhost, так как бот обычно запускается на той же машине
 		url = "http://localhost:11434"
+	}
+
+	// Предупреждение о незашифрованном соединении с удалённым сервером
+	if strings.HasPrefix(url, "http://") &&
+		!strings.Contains(url, "localhost") &&
+		!strings.Contains(url, "127.0.0.1") {
+		log.Printf("ВНИМАНИЕ: соединение с Ollama по незашифрованному HTTP к удалённому серверу (%s). Рекомендуется использовать HTTPS.", url)
 	}
 
 	model := os.Getenv("OLLAMA_MODEL")
@@ -84,11 +93,11 @@ func (c *OllamaClient) SendPrompt(prompt string) (string, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
 		return "", fmt.Errorf("Ollama API вернул статус %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
 	if err != nil {
 		return "", fmt.Errorf("ошибка чтения ответа: %w", err)
 	}
