@@ -7,12 +7,21 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
+)
+
+const (
+	// maxResponseSize ограничивает размер ответа от API (10 МБ)
+	maxResponseSize = 10 * 1024 * 1024
 )
 
 // Telegram API структуры
 type Update struct {
-	UpdateID int64   `json:"update_id"`
+	UpdateID int64    `json:"update_id"`
 	Message  *Message `json:"message,omitempty"`
 }
 
@@ -43,45 +52,146 @@ type SendMessageRequest struct {
 }
 
 type TelegramResponse struct {
-	OK     bool   `json:"ok"`
-	Result interface{} `json:"result,omitempty"`
-	Description string `json:"description,omitempty"`
+	OK          bool        `json:"ok"`
+	Result      interface{} `json:"result,omitempty"`
+	Description string      `json:"description,omitempty"`
 }
 
 // TelegramBot структура для работы с Telegram Bot API
 type TelegramBot struct {
-	Token      string
-	APIURL     string
-	Ollama     *OllamaClient
-	LastUpdate int64
+	Token        string
+	APIURL       string
+	Ollama       *OllamaClient
+	LastUpdate   int64
+	AllowedUsers map[int64]bool
+	rateLimiter  map[int64][]time.Time
+	mu           sync.Mutex
+	maxRequests  int
+	rateWindow   time.Duration
+	maxPromptLen int
 }
 
 // NewTelegramBot создает новый экземпляр бота
 func NewTelegramBot(token string) *TelegramBot {
-	return &TelegramBot{
-		Token:      token,
-		APIURL:     "https://api.telegram.org/bot" + token,
-		Ollama:     NewOllamaClient(),
-		LastUpdate: 0,
+	// Парсинг списка разрешённых пользователей
+	allowedUsers := make(map[int64]bool)
+	if ids := os.Getenv("ALLOWED_USER_IDS"); ids != "" {
+		for _, idStr := range strings.Split(ids, ",") {
+			idStr = strings.TrimSpace(idStr)
+			if id, err := strconv.ParseInt(idStr, 10, 64); err == nil {
+				allowedUsers[id] = true
+			}
+		}
+		log.Printf("Настроен список разрешённых пользователей: %d пользователь(ей)", len(allowedUsers))
+	} else {
+		log.Println("ВНИМАНИЕ: ALLOWED_USER_IDS не задан — бот доступен всем пользователям")
 	}
+
+	// Настройка rate limiting
+	maxReq := 10
+	if v := os.Getenv("RATE_LIMIT_MAX"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			maxReq = n
+		}
+	}
+
+	rateWindow := time.Minute
+	if v := os.Getenv("RATE_LIMIT_WINDOW"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			rateWindow = d
+		}
+	}
+
+	// Настройка максимальной длины промпта
+	maxPromptLen := 4096
+	if v := os.Getenv("MAX_PROMPT_LENGTH"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			maxPromptLen = n
+		}
+	}
+
+	return &TelegramBot{
+		Token:        token,
+		APIURL:       "https://api.telegram.org/bot" + token,
+		Ollama:       NewOllamaClient(),
+		LastUpdate:   0,
+		AllowedUsers: allowedUsers,
+		rateLimiter:  make(map[int64][]time.Time),
+		maxRequests:  maxReq,
+		rateWindow:   rateWindow,
+		maxPromptLen: maxPromptLen,
+	}
+}
+
+// sanitizeError удаляет токен бота из сообщений об ошибках,
+// чтобы токен не утёк в логи или к пользователям
+func (bot *TelegramBot) sanitizeError(err error) error {
+	if err == nil {
+		return nil
+	}
+	sanitized := strings.ReplaceAll(err.Error(), bot.Token, "[REDACTED]")
+	return fmt.Errorf("%s", sanitized)
+}
+
+// isUserAllowed проверяет, разрешён ли пользователь.
+// Если ALLOWED_USER_IDS не задан (список пуст), доступ разрешён всем.
+func (bot *TelegramBot) isUserAllowed(message *Message) bool {
+	if len(bot.AllowedUsers) == 0 {
+		return true
+	}
+	if message.From != nil {
+		return bot.AllowedUsers[message.From.ID]
+	}
+	return bot.AllowedUsers[message.Chat.ID]
+}
+
+// checkRateLimit проверяет, не превышен ли лимит запросов для пользователя.
+// Использует алгоритм скользящего окна.
+func (bot *TelegramBot) checkRateLimit(userID int64) bool {
+	bot.mu.Lock()
+	defer bot.mu.Unlock()
+
+	now := time.Now()
+	windowStart := now.Add(-bot.rateWindow)
+
+	// Фильтруем записи старше окна
+	var recent []time.Time
+	for _, t := range bot.rateLimiter[userID] {
+		if t.After(windowStart) {
+			recent = append(recent, t)
+		}
+	}
+
+	if len(recent) >= bot.maxRequests {
+		bot.rateLimiter[userID] = recent
+		return false
+	}
+
+	bot.rateLimiter[userID] = append(recent, now)
+	return true
 }
 
 // GetUpdates получает обновления от Telegram через long polling
 func (bot *TelegramBot) GetUpdates() ([]Update, error) {
 	url := fmt.Sprintf("%s/getUpdates?offset=%d&timeout=30", bot.APIURL, bot.LastUpdate+1)
 
-	resp, err := http.Get(url)
+	// Используем клиент с таймаутом: 30с long polling + 10с запас
+	client := &http.Client{
+		Timeout: 40 * time.Second,
+	}
+
+	resp, err := client.Get(url)
 	if err != nil {
-		return nil, fmt.Errorf("ошибка запроса к Telegram API: %w", err)
+		return nil, fmt.Errorf("ошибка запроса к Telegram API: %w", bot.sanitizeError(err))
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
 		return nil, fmt.Errorf("Telegram API вернул статус %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
 	if err != nil {
 		return nil, fmt.Errorf("ошибка чтения ответа: %w", err)
 	}
@@ -129,7 +239,7 @@ func (bot *TelegramBot) SendMessage(chatID int64, text string) error {
 	url := bot.APIURL + "/sendMessage"
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
-		return fmt.Errorf("ошибка создания HTTP запроса: %w", err)
+		return fmt.Errorf("ошибка создания HTTP запроса: %w", bot.sanitizeError(err))
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -140,16 +250,16 @@ func (bot *TelegramBot) SendMessage(chatID int64, text string) error {
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("ошибка выполнения HTTP запроса: %w", err)
+		return fmt.Errorf("ошибка выполнения HTTP запроса: %w", bot.sanitizeError(err))
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
 		return fmt.Errorf("Telegram API вернул статус %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
 	if err != nil {
 		return fmt.Errorf("ошибка чтения ответа: %w", err)
 	}
@@ -169,6 +279,12 @@ func (bot *TelegramBot) SendMessage(chatID int64, text string) error {
 // HandleMessage обрабатывает входящее сообщение
 func (bot *TelegramBot) HandleMessage(message *Message) {
 	if message == nil || message.Chat == nil {
+		return
+	}
+
+	// Проверка авторизации пользователя
+	if !bot.isUserAllowed(message) {
+		log.Printf("Отклонён запрос от неавторизованного пользователя (chat_id: %d)", message.Chat.ID)
 		return
 	}
 
@@ -195,7 +311,7 @@ func (bot *TelegramBot) handleCommand(chatID int64, command string) {
 			"Просто отправь мне сообщение, и я передам его модели для генерации ответа.\n\n" +
 			"Используй /help для получения справки."
 		if err := bot.SendMessage(chatID, msg); err != nil {
-			log.Printf("Ошибка отправки сообщения: %v", err)
+			log.Printf("Ошибка отправки сообщения: %v", bot.sanitizeError(err))
 		}
 
 	case "/help":
@@ -204,7 +320,7 @@ func (bot *TelegramBot) handleCommand(chatID int64, command string) {
 			"/help - эта справка\n\n" +
 			"Любое другое сообщение будет отправлено в Ollama для генерации ответа."
 		if err := bot.SendMessage(chatID, msg); err != nil {
-			log.Printf("Ошибка отправки сообщения: %v", err)
+			log.Printf("Ошибка отправки сообщения: %v", bot.sanitizeError(err))
 		}
 
 	default:
@@ -215,22 +331,35 @@ func (bot *TelegramBot) handleCommand(chatID int64, command string) {
 
 // handleTextMessage обрабатывает текстовые сообщения
 func (bot *TelegramBot) handleTextMessage(chatID int64, text string) {
+	// Проверка rate limit
+	if !bot.checkRateLimit(chatID) {
+		bot.SendMessage(chatID, "Слишком много запросов. Пожалуйста, подождите немного.")
+		return
+	}
+
+	// Проверка длины промпта
+	if len(text) > bot.maxPromptLen {
+		bot.SendMessage(chatID, fmt.Sprintf("Сообщение слишком длинное. Максимальная длина: %d символов.", bot.maxPromptLen))
+		return
+	}
+
 	// Отправляем сообщение о том, что запрос обрабатывается
 	bot.SendMessage(chatID, "Обрабатываю запрос...")
 
 	// Отправляем запрос в Ollama
 	response, err := bot.Ollama.SendPrompt(text)
 	if err != nil {
-		errorMsg := fmt.Sprintf("Произошла ошибка при обращении к Ollama:\n\n%s", err.Error())
-		if err := bot.SendMessage(chatID, errorMsg); err != nil {
-			log.Printf("Ошибка отправки сообщения об ошибке: %v", err)
+		// Логируем полную ошибку на сервере, пользователю — общее сообщение
+		log.Printf("Ошибка от Ollama для chat %d: %v", chatID, err)
+		if sendErr := bot.SendMessage(chatID, "Произошла ошибка при обработке запроса. Попробуйте позже."); sendErr != nil {
+			log.Printf("Ошибка отправки сообщения об ошибке: %v", bot.sanitizeError(sendErr))
 		}
 		return
 	}
 
 	// Разбиваем длинные ответы на части
 	parts := SplitMessage(response, 4000)
-	
+
 	// Отправляем каждую часть
 	for i, part := range parts {
 		if i == 0 && len(parts) > 1 {
@@ -238,7 +367,7 @@ func (bot *TelegramBot) handleTextMessage(chatID int64, text string) {
 			part = part + "\n\n[Продолжение следует...]"
 		}
 		if err := bot.SendMessage(chatID, part); err != nil {
-			log.Printf("Ошибка отправки части сообщения: %v", err)
+			log.Printf("Ошибка отправки части сообщения: %v", bot.sanitizeError(err))
 		}
 		// Небольшая задержка между сообщениями, чтобы не превысить rate limit
 		if i < len(parts)-1 {
